@@ -1,10 +1,12 @@
 'use strict';
 
-var exec = require('child_process').exec
-  , spawn = require('child_process').spawn
-  , path = require('path')
-  , domain = require('domain')
-  , d = domain.create();
+let exec = require('child_process').exec;
+let spawn = require('child_process').spawn;
+let path = require('path');
+let fs = require('fs');
+let zlib = require('zlib');
+let AWS = require('aws-sdk');
+AWS.config.loadFromPath('./aws-config.json');
 
 /**
  * log
@@ -174,44 +176,33 @@ function compressDirectory(directory, input, output, callback) {
  * @param callback  callback(err)
  */
 function sendToS3(options, directory, target, callback) {
-  var knox = require('knox')
-    , sourceFile = path.join(directory, target)
+    let sourceFile = path.join(directory, target)
     , s3client
     , destination = options.destination || '/'
     , headers = {};
 
   callback = callback || function() { };
 
-  // Deleting destination because it's not an explicitly named knox option
-  delete options.destination;
-  s3client = knox.createClient(options);
-
-  if (options.encrypt)
-    headers = {"x-amz-server-side-encryption": "AES256"}
-
+  console.log(JSON.stringify(AWS.config));
   log('Attemping to upload ' + target + ' to the ' + options.bucket + ' s3 bucket');
-  s3client.putFile(sourceFile, path.join(destination, target), headers, function(err, res){
+  //AWS.config.update({region: 'us-west-1'});
+  let body = fs.createReadStream(sourceFile).pipe(zlib.createGzip());
+  let s3obj = new AWS.S3({params: { Bucket: options.bucket, Key: target, ServerSideEncryption: 'AES256' }});
+
+  // Go Go Upload
+  s3obj.upload({Body: body}, (err, data) => {
     if(err) {
       return callback(err);
     }
 
-    res.setEncoding('utf8');
-
-    res.on('data', function(chunk){
-      if(res.statusCode !== 200) {
-        log(chunk, 'error');
-      } else {
-        log(chunk);
-      }
-    });
-
-    res.on('end', function(chunk) {
-      if (res.statusCode !== 200) {
-        return callback(new Error('Expected a 200 response from S3, got ' + res.statusCode));
-      }
-      log('Successfully uploaded to s3');
-      return callback();
-    });
+    log('Successfully uploaded to s3');
+    return callback();
+  })
+  .on('httpUploadProgress', function(evt) {
+    log(evt);
+  })
+  .send(function(err, data) {
+    console.log(err, data)
   });
 }
 
@@ -242,10 +233,13 @@ function sync(mongodbConfig, s3Config, callback) {
   async.series(tmpDirCleanupFns.concat([
     async.apply(mongoDump, mongodbConfig, tmpDir),
     async.apply(compressDirectory, tmpDir, mongodbConfig.db, archiveName),
-    d.bind(async.apply(sendToS3, s3Config, tmpDir, archiveName)) // this function sometimes throws EPIPE errors
+    async.apply(sendToS3, s3Config, tmpDir, archiveName)
   ]), function(err) {
     if(err) {
       log(err, 'error');
+      async.series(tmpDirCleanupFns, function() {
+        throw(err);
+      });
     } else {
       log('Successfully backed up ' + mongodbConfig.db);
     }
@@ -253,14 +247,6 @@ function sync(mongodbConfig, s3Config, callback) {
     async.series(tmpDirCleanupFns, function() {
       return callback(err);
     });
-  });
-
-  // this cleans up folders in case of EPIPE error from AWS connection
-  d.on('error', function(err) {
-      d.exit()
-      async.series(tmpDirCleanupFns, function() {
-        throw(err);
-      });
   });
 
 }
